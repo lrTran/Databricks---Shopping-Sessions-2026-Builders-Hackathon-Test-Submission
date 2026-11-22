@@ -1,9 +1,12 @@
 # Shopping Sessions — Rust pipeline
 
-A complete, correct-first implementation of `rules.md` in Rust. It passes all 36
-edge-case fixtures and matches an independent Python reference exactly on
-synthetic dirty data. Run `make check-dev` against the published dev answer
-before your first submission (see "Before you submit").
+A complete, correct-first implementation of `rules.md` in Rust.
+
+* Matches the published dev answer exactly (`make check-dev`: 118,107 + 27,449 rows).
+* Passes all 36 edge-case fixtures.
+* Matches an independent Python reference exactly on official-generator seeds
+  2–7 and 15 (seed 15's window holds 2028-02-29), and on 8 seeds of extra-dirty
+  synthetic data.
 
 ## Why Rust
 
@@ -85,18 +88,26 @@ You need cargo (Rust 1.85 or newer) and `pip install polars==2.1.0` for the test
 scripts. Docker is only needed for the scorer-like targets.
 
 ```sh
+Build the official generator once from generator.zip (`cargo build --release`)
+and put `target/release/generate` on your PATH, or pass `GENERATE=/path/to/generate`.
+Unzip dev-answer.zip into the repo root as `dev-answer/`.
+
+```sh
 make test            # unit tests: CSV dialect + timestamps
 make fixtures-local  # 36/36 fixtures, native binary, about a second
-make synth-check     # Rust vs Python reference on 6 synthetic seeds (odd/even toggle \r dirt)
-make synth-check SEEDS="11 12 13" SYNTH_EVENTS=300000   # more/bigger
+make dev             # the 1M-event dev set (seed 1)
+make run-dev-local   # run natively on dev/ and diff against dev-answer/: prints MATCH
+make gen-check       # official generator, seeds 2 3 4 5 15: Rust vs Python reference
+make synth-check     # extra-dirty synthetic data (\r, odd quoting): Rust vs reference
 
 make build fixtures  # same fixtures through the real image and scorer flags
-make dev             # needs `generate` from generator.zip on PATH
 make run-dev         # image on dev/ with scorer limits, timed
-make check-dev       # exact diff vs dev-answer/ (unzip dev-answer.zip in the repo root)
+make check-dev       # exact diff of that run's out/ vs dev-answer/
+```
 ```
 
-`synth.py` imitates the dirt in rules.md (duplicate events where the earliest
+Only seed 1 has a published answer, so `gen-check` and `synth-check` provide
+the other oracles. `synth.py` imitates the dirt in rules.md (duplicate events where the earliest
 copy has a bad `ts` or a different user, link chains, shared devices, boundary
 clicks, same-millisecond ties, quoting, malformed lines, `\r`). It is not the
 official generator, so `check-dev` remains the ground truth. The two test
@@ -105,8 +116,8 @@ out which one is wrong. Once, during development, it was the synthesizer.
 
 ## Before you submit
 
-1. `make test fixtures-local synth-check` all green.
-2. `make dev run-dev check-dev` prints `MATCH`, and the time is well under 15 s.
+1. `make test fixtures-local run-dev-local gen-check synth-check` all green.
+2. `make run-dev check-dev` prints `MATCH` through Docker, well under 15 s.
    The stderr log shows each stage's time.
 3. `make build fixtures` passes through Docker on linux/amd64.
 4. Push to a public GitHub repo. No data is committed: `.gitignore` excludes
@@ -114,11 +125,19 @@ out which one is wrong. Once, during development, it was the synthesizer.
 
 ## Measured so far
 
-These were measured in a 1-core sandbox without Docker, so they are only
-indicative. 3.4M synthetic event lines (307 MB) take 1.5 s end to end: parsing
-1.0 s, dedup 0.2 s, sessionize 0.25 s. Scaling that to 60M events on 8 vCPUs
-suggests single-digit seconds, far inside the 3-minute cap. Peak memory at
-final size should be around 7 GB, plus page cache.
+These were measured on official-generator data in a 1-core, 3 GB sandbox,
+without Docker:
+
+| Dataset | Input | Wall time (1 thread) | Peak RSS |
+| --- | --- | --- | --- |
+| dev, seed 1, 1M events | 100 MB | 0.8 s | — |
+| seed 9, 5M events | 497 MB | 2.9 s (parse 1.7, dedup 0.4, sessionize 0.5) | 1.1 GB |
+
+Scaling linearly, the 60M-event final is about 35 s of single-core work, so
+about 5–8 s on 8 vCPUs. That is far inside the 3-minute cap, though Docker
+and the scorer will add some overhead. Peak RSS at that size would be about
+14 GB, and roughly half of it is the memory-mapped input, which the kernel can
+reclaim.
 
 ## Where to find more speed
 

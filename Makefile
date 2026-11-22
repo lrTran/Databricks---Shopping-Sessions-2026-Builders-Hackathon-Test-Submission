@@ -9,9 +9,13 @@ FIXTURES ?= fixtures
 BIN := target/release/sessions
 SEEDS ?= 1 2 3 4 5 6
 SYNTH_EVENTS ?= 150000
+# The official generator (build it from generator.zip: cargo build --release)
+GENERATE ?= generate
+GEN_SEEDS ?= 2 3 4 5 15
+GEN_EVENTS ?= 150000
 export IMAGE CPUS MEM PLATFORM
 
-.PHONY: bin test fixtures-local synth-check build fixtures dev run-dev run-dev-local check-dev clean
+.PHONY: bin test fixtures-local synth-check gen-check build fixtures dev run-dev run-dev-local check-dev clean
 
 ## ---- Fast local loop (no Docker): needs cargo and `pip install polars==2.1.0` ----
 
@@ -36,9 +40,21 @@ synth-check: bin
 	  python3 scripts/compare.py synth/out-rs-$$s synth/out-py-$$s | tail -1; \
 	done
 
-## Native run on the dev set (timing is only indicative)
+## Differential test on official-generator data: Rust vs the Python reference.
+## Seed 15's window holds 2028-02-29.
+gen-check: bin
+	@set -e; for s in $(GEN_SEEDS); do \
+	  rm -rf synth/gen-$$s synth/out-rs-gen-$$s synth/out-py-gen-$$s; \
+	  $(GENERATE) --seed $$s --events $(GEN_EVENTS) --clicks $$(( $(GEN_EVENTS) / 4 )) --output synth/gen-$$s >/dev/null; \
+	  $(BIN) synth/gen-$$s synth/out-rs-gen-$$s 2>/dev/null; \
+	  python3 scripts/reference.py synth/gen-$$s synth/out-py-gen-$$s; \
+	  printf "seed $$s: "; python3 scripts/compare.py synth/out-rs-gen-$$s synth/out-py-gen-$$s | tail -1; \
+	done
+
+## Native run on the dev set, then the exact diff (no Docker needed)
 run-dev-local: bin
-	rm -rf out && time $(BIN) $(DEV) out
+	rm -rf out && $(BIN) $(DEV) out
+	python3 scripts/compare.py out $(ANSWER)
 
 ## ---- Scorer-like loop (Docker) ----
 
@@ -50,9 +66,9 @@ build:
 fixtures: build
 	python3 scripts/run_fixtures.py $(FIXTURES) -- scripts/docker_run.sh
 
-## Make the 1M-event dev set with the published generator (needs `generate` on PATH, from generator.zip)
+## Make the 1M-event dev set with the official generator (GENERATE=path/to/generate if not on PATH)
 dev:
-	generate --seed 1 --events 1000000 --clicks 250000 --output $(DEV)
+	$(GENERATE) --seed 1 --events 1000000 --clicks 250000 --output $(DEV)
 
 ## Run the image on the dev set with scorer flags and time it
 run-dev: build
