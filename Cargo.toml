@@ -1,0 +1,22 @@
+[package]
+name = "sessions"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+resolver = "3"
+
+[dependencies]
+memchr = "2"
+memmap2 = "0.9"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+# Low-level Parquet writer only: no arrow, no codecs. Keeps the build fast.
+parquet = { version = "55", default-features = false }
+bytes = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+strip = true
