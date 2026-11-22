@@ -20,9 +20,11 @@ ideas about quotes, `\r` and malformed lines, which rules.md overrides.
 
 ```
 Dockerfile            two-stage build: rust:1.85 builder -> debian slim runtime, runs as uid 1000
-Cargo.toml/.lock      memchr, memmap2, xxhash-rust, parquet (no Arrow, no codecs)
-src/csv.rs            the CSV dialect, exactly (quotes, \r, field counts, empty lines)
-src/ts.rs             timestamp forms F1/F2/F3, calendar and offset validation, ASCII digits only
+Cargo.toml/.lock      memchr, memmap2, xxhash-rust, libc, parquet (no Arrow, no codecs)
+src/scan.rs           SIMD scanner: the CSV dialect, 64 bytes at a time (quotes, \r, field counts, empty lines)
+src/csv.rs            the same dialect line by line, for the small files, plus file chunking
+src/ts.rs             timestamp forms F1/F2/F3: a plain reference parser, and a fast cached one fuzzed against it
+src/arena.rs          per-thread huge-page arenas and segmented vectors for the record buffers
 src/out.rs            Parquet writer (day = INT32 DATE, strings UTF8)
 src/main.rs           the pipeline
 scripts/reference.py  slow, literal Python implementation of rules.md, for differential testing
@@ -37,25 +39,30 @@ rules.md              the spec; it wins over everything else
 Everything stays in memory: about 5 GB of CSV and well under 24 GB of working
 set at final size. One pool of `$NCPU` threads runs each stage:
 
-1. **Small inputs.** manifest, products, campaigns. Categories are sorted
-   byte-wise (with `unknown` added), so "tie goes to the smallest category"
-   becomes "smallest integer id".
-2. **Links.** Parsed in parallel, then union-find, with each component named by its
-   byte-wise smallest ID. A person's *key* is `xxh3_64(name)`. An unlinked ID's
-   key is just the hash of the ID, so only linked IDs whose name is a *different*
-   ID need a lookup entry.
-3. **Parse events and clicks.** The files are memory-mapped and split into ~8 MB
-   chunks at line boundaries, largest first. Each line is checked against the
-   dialect. Validation and the late check depend only on that copy, so they are
-   decided here and stored as a flag. Event copies go into 1,024 buckets by
-   `xxh3_128(event_id)`. Valid clicks go into 1,024 buckets by person key.
-4. **Dedup.** For each event-id bucket, a hash map keeps the copy with the
-   smallest `ingest_ts`. That copy survives only if its own flag says valid, so
-   dedup happens before validation and a later valid copy never rescues the event.
-   Survivors are scattered into person buckets.
-5. **Sessionize and attribute.** For each person bucket, sort events by
-   `(person, ts)` and clicks by `(person, ts, click_id descending)`, then walk each
-   person:
+1. **Links, on a side thread.** The links are parsed and merged with union-find,
+   and each component is named by its byte-wise smallest ID. A person's *key* is
+   `xxh3_64(name)`, so an unlinked ID's key is just the hash of the ID. Only
+   linked IDs whose name is a *different* ID go into an open-addressing table of
+   `uid hash -> (person key, name)`. This thread runs while step 2 parses, so
+   it costs no wall time.
+2. **Parse events and clicks.** The files are memory-mapped and split into ~8 MB
+   chunks at line boundaries, largest first. `scan.rs` finds every `,` `"` `\n`
+   with SSE2 bitmasks and walks only those positions. Validation and the late
+   check depend only on that copy of the event, so they are decided here.
+   Timestamps go through a per-thread cache of the ~21 distinct dates. Event
+   copies become 48-byte records in 1,024 buckets by `xxh3_128(event_id)`.
+   Valid clicks become 24-byte records. Neither needs its person yet.
+3. **Dedup and resolve.** For each event-id bucket, an open-addressing table
+   keeps the copy with the smallest `ingest_ts`. That copy survives only if its
+   own flag says valid, so dedup happens before validation and a later valid
+   copy never rescues the event. The survivors' persons are then looked up in
+   batches, with memory prefetching to hide cache misses, and the survivors are
+   scattered into 1,024 person buckets as 24-byte records. Clicks are resolved
+   the same way.
+4. **Sessionize and attribute.** In each person bucket, a small hash table and
+   a counting sort group events and clicks by person in linear time. Then each
+   person's events are sorted by `ts`, and their clicks by `(ts, click_id
+   descending)`. For each person:
    * A session breaks when `ts - prev > 30 min`. Equal timestamps have a gap of
      0, so they always join.
    * Two pointers keep the click window `[start - 7d, start]` with a multiset of
@@ -64,8 +71,15 @@ set at final size. One pool of `$NCPU` threads runs each stage:
      the campaigns currently in the multiset.
    * user_daily is aggregated per (person, day of session start).
    * campaign_daily is aggregated into a dense `[campaign][day]` array per thread.
-6. **Write.** One user_daily file per worker, written in parallel, plus one
-   campaign_daily file.
+5. **Write.** One user_daily file per worker, written in parallel, plus one
+   campaign_daily file. Then `process::exit` skips gigabytes of destructors.
+
+The record buffers come from per-thread **arenas** (`arena.rs`). Each is a
+large virtual reservation marked for transparent huge pages and populated in
+4 MB steps with `MADV_POPULATE_WRITE`. This removes most page faults, which
+otherwise cost more as threads are added. Nothing is freed mid-run, because
+`munmap` interrupts every core. On kernels without these features the
+`madvise` calls fail harmlessly.
 
 Progress and timings are logged to stderr.
 
@@ -81,6 +95,10 @@ Progress and timings are logged to stderr.
   the two agree.
 * An `ingest_ts` that fails to parse (rules.md says it never does) is treated as
   +infinity.
+* Compact records assume, and check at startup, that window_start − 7 days to
+  window_end fits in u32 milliseconds (49 days; the generator uses 14 + 7), and
+  that there are at most 255 categories (the generator has 20). IDs must be
+  shorter than 64 KB, because their length is packed into 16 bits.
 
 ## Local workflow
 
@@ -126,34 +144,31 @@ out which one is wrong. Once, during development, it was the synthesizer.
 ## Measured so far
 
 These were measured on official-generator data in a 1-core, 3 GB sandbox,
-without Docker:
+without Docker. Old and new runs alternated so they saw the same conditions.
 
-| Dataset | Input | Wall time (1 thread) | Peak RSS |
+| Dataset | First version | Optimized | Peak RSS |
 | --- | --- | --- | --- |
-| dev, seed 1, 1M events | 100 MB | 0.8 s | — |
-| seed 9, 5M events | 497 MB | 2.9 s (parse 1.7, dedup 0.4, sessionize 0.5) | 1.1 GB |
+| dev, seed 1, 1M events | 436 ms | 298 ms | — |
+| seed 9, 5M events | 2,653 ms | 1,530 ms | 1.06 GB |
 
-Scaling linearly, the 60M-event final is about 35 s of single-core work, so
-about 5–8 s on 8 vCPUs. That is far inside the 3-minute cap, though Docker
-and the scorer will add some overhead. Peak RSS at that size would be about
-14 GB, and roughly half of it is the memory-mapped input, which the kernel can
-reclaim.
+On 5M events, user CPU went from 2.12 s to 1.41 s and page faults from 189k to
+48k. The first version scored about 2.3 s on the practice data.
 
 ## Where to find more speed
 
-Measure on `make run-dev` first. Parsing dominates, so these come in roughly
-that order:
+Callgrind (`valgrind --tool=callgrind`) works on this binary, built with
+`CARGO_PROFILE_RELEASE_DEBUG=line-tables-only CARGO_PROFILE_RELEASE_STRIP=false`.
+On the dev set, by instructions, the scanner is about a third of the run and
+timestamps about a tenth. Ideas, roughly in order:
 
-* **Faster line/field scanning.** Find `\n`, `,` and `"` with SIMD over the
-  whole chunk (memchr3 or AVX2 bitmasks) instead of a per-byte loop.
-* **Overlap links with parsing.** Store the uid hash in the parsed record and
-  resolve the person in the dedup stage, so union-find runs while events parse.
-* **Smaller records.** `Ev` is 64 B. Pack price and category, and keep the uid
-  pointer only for persons with no link entry, to cut memory bandwidth in the
-  two shuffles.
-* **Radix sort** by (person, ts) instead of comparison sort in stage 5.
-* `-C target-cpu=x86-64-v3` (AVX2) in the Dockerfile's build stage. The scorers
-  are Cascade Lake or newer, but keep a fallback for arm64 local builds.
-* Huge pages or `MAP_POPULATE`, if page faults show up in a profile.
+* **Scanner.** Most of its cost is the per-character loop, not the bitmasks.
+  Ideas: process a whole line from its comma mask, or AVX-512 masks with runtime
+  detection (the scorers have it).
+* **Hashing.** The event ID could use a 64-bit hash, with the bytes compared on
+  a match, to shrink `Ev` to 40 bytes.
+* **Reuse memory between stages.** Zeroing fresh pages is now most of the kernel
+  time. The dedup stage's output arena could reuse the parse stage's memory.
+* Measure on the real 8 vCPUs before tuning further: thread scaling there is
+  untested.
 
 Re-run `make fixtures-local synth-check check-dev` after every optimization.

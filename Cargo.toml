@@ -12,6 +12,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 # Low-level Parquet writer only: no arrow, no codecs. Keeps the build fast.
 parquet = { version = "55", default-features = false }
 bytes = "1"
+libc = "0.2"
 
 [profile.release]
 opt-level = 3
